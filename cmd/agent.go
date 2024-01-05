@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,10 +16,29 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
 	"fmt"
-
+	goredis "github.com/go-redis/redis"
+	"github.com/matryer/vice/v2/queues/redis"
 	"github.com/spf13/cobra"
+	"log"
+	"time"
 )
+
+func Greeter(ctx context.Context, names <-chan []byte, greetings chan<- []byte, errs <-chan error) {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("finished")
+			return
+		case err := <-errs:
+			log.Println("an error occurred:", err)
+		case name := <-names:
+			greeting := "Hello " + string(name)
+			greetings <- []byte(greeting)
+		}
+	}
+}
 
 // agentCmd represents the agent command
 var agentCmd = &cobra.Command{
@@ -33,6 +52,43 @@ This application is a tool to generate the needed files
 to quickly create a Cobra application.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("agent called")
+		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+		defer cancel()
+
+		redisOptions := goredis.Options{
+			Addr:     "localhost:6379", // use default Addr
+			Password: "",               // no password set
+			DB:       0,                // use default DB
+		}
+
+		redisClient := goredis.NewClient(&redisOptions)
+		transport := redis.New(redis.WithClient(redisClient))
+		defer func() {
+			transport.Stop()
+			<-transport.Done()
+		}()
+		log.Printf("Setting myself as active agent...")
+		workersChannel := transport.Send("global-nosql-benchmark:workers")
+		mychannel := fmt.Sprintf("global-nosql-benchmark:workers:%s", "myid")
+		workersChannel <- []byte("eu-weast-1")
+		workReceiverChannel := transport.Receive()
+		errs := transport.ErrChan()
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("finished")
+				return
+			case err := <-errs:
+				log.Println("an error occurred:", err)
+			case name := <-names:
+				greeting := "Hello " + string(name)
+				greetings <- []byte(greeting)
+			}
+		}
+
+		log.Printf("closing myself...")
 	},
 }
 
