@@ -15,7 +15,11 @@ limitations under the License.
 */
 package main
 
-import "github.com/filipecosta90/global-nosql-benchmark/cmd"
+import (
+	"github.com/filipecosta90/global-nosql-benchmark/cmd"
+	// Register redis database
+	_ "github.com/filipecosta90/global-nosql-benchmark/cmd/db/redis"
+)
 
 func main() {
 	cmd.Execute()

@@ -17,25 +17,38 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/HdrHistogram/hdrhistogram-go"
 	goredis "github.com/go-redis/redis"
 	"github.com/matryer/vice/v2/queues/redis"
 	"github.com/spf13/cobra"
+	"golang.org/x/time/rate"
 	"log"
+	"math/rand"
+	"sync"
 	"time"
 )
 
-func Greeter(ctx context.Context, names <-chan []byte, greetings chan<- []byte, errs <-chan error) {
+var CommandTypeLatenciesRead *hdrhistogram.Histogram
+var CommandTypeLatenciesWrite *hdrhistogram.Histogram
+
+func processGraphDatapointsChannel(graphStatsChann chan Datapoint, ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
 	for {
 		select {
+		case dp := <-graphStatsChann:
+			{
+				switch dp.Type {
+				case CommandTypeRead:
+					CommandTypeLatenciesRead.RecordValue(int64(dp.Latency))
+				case CommandTypeWrite:
+					CommandTypeLatenciesWrite.RecordValue(int64(dp.Latency))
+				}
+			}
 		case <-ctx.Done():
-			log.Println("finished")
+			fmt.Println("\nReceived Ctrl-c - shutting down datapoints processor go-routine")
 			return
-		case err := <-errs:
-			log.Println("an error occurred:", err)
-		case name := <-names:
-			greeting := "Hello " + string(name)
-			greetings <- []byte(greeting)
 		}
 	}
 }
@@ -53,27 +66,29 @@ to quickly create a Cobra application.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("agent called")
 		ctx := context.Background()
-		ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
-		defer cancel()
-
+		viceAddr, _ := cmd.Flags().GetString("messaging-queue-addr")
+		vicePassword, _ := cmd.Flags().GetString("messaging-queue-password")
 		redisOptions := goredis.Options{
-			Addr:     "localhost:6379", // use default Addr
-			Password: "",               // no password set
-			DB:       0,                // use default DB
+			Addr:     viceAddr,
+			Password: vicePassword,
 		}
-
 		redisClient := goredis.NewClient(&redisOptions)
 		transport := redis.New(redis.WithClient(redisClient))
 		defer func() {
 			transport.Stop()
 			<-transport.Done()
 		}()
-		log.Printf("Setting myself as active agent...")
+		agentId, _ := cmd.Flags().GetString("agent-unique-id")
+		log.Printf("Setting myself as active agent. Agent unique-id %s", agentId)
 		workersChannel := transport.Send("global-nosql-benchmark:workers")
-		mychannel := fmt.Sprintf("global-nosql-benchmark:workers:%s", "myid")
-		workersChannel <- []byte("eu-weast-1")
-		workReceiverChannel := transport.Receive()
+		mychannel := fmt.Sprintf("global-nosql-benchmark:workers:%s", agentId)
+		workersChannel <- []byte(mychannel)
+		workReceiverChannel := transport.Receive(mychannel)
 		errs := transport.ErrChan()
+		workersChannelFinished := transport.Send(string("global-nosql-benchmark:workers:finish"))
+
+		CommandTypeLatenciesRead = hdrhistogram.New(1, 90000000000, 3)
+		CommandTypeLatenciesWrite = hdrhistogram.New(1, 90000000000, 3)
 
 		for {
 			select {
@@ -82,9 +97,78 @@ to quickly create a Cobra application.`,
 				return
 			case err := <-errs:
 				log.Println("an error occurred:", err)
-			case name := <-names:
-				greeting := "Hello " + string(name)
-				greetings <- []byte(greeting)
+			case spec := <-workReceiverChannel:
+				var testSpec TestSpec
+				if err := json.Unmarshal(spec, &testSpec); err != nil {
+					panic(err)
+				}
+				currentUtc := time.Now().UTC().Unix()
+				differenceUnix := testSpec.StartAtUnix - currentUtc
+				dataPointsProcessingWg := sync.WaitGroup{}
+				dataPointsChann := make(chan Datapoint, testSpec.Clients)
+
+				useRateLimiter := false
+				if testSpec.Rps > 0 {
+					useRateLimiter = true
+				}
+				var requestRate = Inf
+				var requestBurst = int(testSpec.Rps)
+				if testSpec.Rps != 0 {
+					requestRate = rate.Limit(testSpec.Rps)
+					useRateLimiter = true
+				}
+
+				var rateLimiter = rate.NewLimiter(requestRate, requestBurst)
+				log.Printf("Received test spec: %v. sleeping for %d secs and starting test...", testSpec, differenceUnix)
+				log.Printf("Setting read-proportion to %f and insert-proportion to %f.", testSpec.ReadProportion, testSpec.InsertProportion)
+
+				time.Sleep(time.Duration(differenceUnix * int64(time.Second)))
+				log.Printf("Starting test...")
+				// Create a context with a timeout of test duration
+				ctxTimeout, cancel := context.WithTimeout(context.Background(), testSpec.Duration)
+				defer cancel()
+				dataPointsProcessingWg.Add(1)
+				go processGraphDatapointsChannel(dataPointsChann, ctxTimeout, &dataPointsProcessingWg)
+				startT := time.Now()
+				creator := GetDBCreator("redis")
+				db, err := creator.Create(nil)
+				if err != nil {
+					panic(err)
+				}
+				table := "table"
+				for i := 0; i < int(testSpec.Clients); i++ {
+					go agentWork(ctx, db, startT, table, useRateLimiter, rateLimiter, testSpec, dataPointsChann)
+				}
+				log.Printf("Waiting for all datapoints to be processed...")
+				dataPointsProcessingWg.Wait()
+				endT := time.Now()
+				log.Printf("Finished receiving all datapoints...")
+				testResult := NewTestResult(agentId, testSpec.Clients, testSpec.Rps)
+				testResult.EncodedWriteHistogram, err = CommandTypeLatenciesWrite.Encode(hdrhistogram.V2CompressedEncodingCookieBase)
+				if err != nil {
+					panic(err)
+				}
+				testResult.EncodedReadHistogram, err = CommandTypeLatenciesRead.Encode(hdrhistogram.V2CompressedEncodingCookieBase)
+				if err != nil {
+					panic(err)
+				}
+
+				testDuration := endT.Sub(startT)
+				testResult.FillDurationInfo(startT, endT, testDuration)
+				_, latenciesWrites := generateLatenciesMap(CommandTypeLatenciesWrite, testDuration)
+				_, latenciesReads := generateLatenciesMap(CommandTypeLatenciesRead, testDuration)
+				testResult.OverallClientLatencies = make([]map[string]float64, 2, 2)
+				testResult.OverallClientLatencies[0] = latenciesReads
+				testResult.OverallClientLatencies[1] = latenciesWrites
+
+				u, err := json.Marshal(testResult)
+				if err != nil {
+					panic(err)
+				}
+				workersChannelFinished <- u
+				log.Printf("Finished sending test result...")
+				ctx.Done()
+
 			}
 		}
 
@@ -92,16 +176,40 @@ to quickly create a Cobra application.`,
 	},
 }
 
+func agentWork(ctx context.Context, db DB, startT time.Time, table string, useRateLimiter bool, rateLimiter *rate.Limiter, testSpec TestSpec, dataPointsChann chan Datapoint) {
+	var err error = nil
+	testDuration := time.Now().Sub(startT)
+	for testDuration < testSpec.Duration {
+		key := fmt.Sprintf("%d", rand.Int63n(int64(testSpec.RecordCount)))
+		if useRateLimiter {
+			r := rateLimiter.ReserveN(time.Now(), int(1))
+			time.Sleep(r.Delay())
+		}
+		cmdType := CommandTypeRead
+		commandStartT := time.Now()
+		if rand.Float64() > testSpec.ReadProportion {
+			cmdType = CommandTypeRead
+			// read
+			_, err = db.Read(ctx, table, key, testSpec.ReadPreference, []string{"field1"})
+		} else {
+			// write
+			cmdType = CommandTypeWrite
+			err = db.Insert(ctx, table, key, testSpec.NumReplicas, testSpec.NumReplicasTimeoutMillis, map[string][]byte{"field1": []byte(stringWithCharset(int(testSpec.DataSize), charset))})
+		}
+		currentT := time.Now()
+		commandDuration := currentT.Sub(commandStartT)
+		micros := commandDuration.Microseconds()
+		dataPointsChann <- Datapoint{
+			Error:   err != nil,
+			Latency: uint64(micros),
+			Type:    cmdType,
+		}
+		testDuration = currentT.Sub(startT)
+	}
+}
+
 func init() {
 	rootCmd.AddCommand(agentCmd)
 
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// agentCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// agentCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	agentCmd.Flags().String("agent-unique-id", "myid", "Agent unique id")
 }
