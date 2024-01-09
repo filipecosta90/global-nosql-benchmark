@@ -20,7 +20,8 @@ type redisClient interface {
 }
 
 type redis struct {
-	client redisClient
+	client     redisClient
+	readClient redisClient
 }
 
 func (r *redis) Read(ctx context.Context, table string, key string, readPreference int64, fields []string) (data map[string][]byte, err error) {
@@ -31,7 +32,7 @@ func (r *redis) Read(ctx context.Context, table string, key string, readPreferen
 	for _, fieldName := range fields {
 		args = append(args, fieldName)
 	}
-	sliceReply, errI := r.client.Do(ctx, args...).StringSlice()
+	sliceReply, errI := r.readClient.Do(ctx, args...).StringSlice()
 	if errI != nil {
 		return
 	}
@@ -76,10 +77,15 @@ type redisCreator struct{}
 
 func (r redisCreator) Create(p *properties.Properties) (cmd.DB, error) {
 	rds := &redis{}
+	dbAddr := p.GetString("db.addr", "localhost:6379")
+	dbUser := p.GetString("db.username", "")
+	dbPass := p.GetString("db.password", "")
+	dbLocalReadsAddr := p.GetString("db.local.read.addr", "")
 
 	redisOptions := goredis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
+		Addr:     dbAddr,
+		Password: dbPass,
+		Username: dbUser,
 	}
 
 	singleEndpointClient := goredis.NewClient(&redisOptions)
@@ -87,7 +93,23 @@ func (r redisCreator) Create(p *properties.Properties) (cmd.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	rds.client = singleEndpointClient
+	if dbLocalReadsAddr != "" {
+		redisOptionsLocalReads := goredis.Options{
+			Addr:     dbLocalReadsAddr,
+			Password: dbPass,
+			Username: dbUser,
+		}
+		readClient := goredis.NewClient(&redisOptionsLocalReads)
+		err := readClient.Ping(context.Background()).Err()
+		if err != nil {
+			return nil, err
+		}
+		rds.readClient = readClient
+	} else {
+		rds.readClient = singleEndpointClient
+	}
 	return rds, nil
 }
 

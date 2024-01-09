@@ -19,6 +19,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/HdrHistogram/hdrhistogram-go"
+	"os"
 	"time"
 
 	goredis "github.com/go-redis/redis"
@@ -62,15 +64,16 @@ to quickly create a Cobra application.`,
 		connsPerAgent, _ := cmd.Flags().GetUint64("conns-per-agent")
 		duration, _ := cmd.Flags().GetDuration("duration")
 		delayStart, _ := cmd.Flags().GetDuration("delay-start")
-		rps, _ := cmd.Flags().GetInt64("rps")
+		rps, _ := cmd.Flags().GetUint64("rps")
 		recordCount, _ := cmd.Flags().GetUint64("record-count")
 		dataSize, _ := cmd.Flags().GetUint64("data-size")
 		dbAddr, _ := cmd.Flags().GetString("db.addr")
 		dbPassword, _ := cmd.Flags().GetString("db.password")
 		dbUser, _ := cmd.Flags().GetString("db.user")
+		var totalAgentsDone int64 = 0
 		rpsPerAgent := rps
 		if rps > 0 {
-			rpsPerAgent = rps / numAgents
+			rpsPerAgent = rps / uint64(numAgents)
 			log.Printf("Given you've specified a rate of %d requests/sec and there are %d agents, each agent will do %d rps...", rps, numAgents, rpsPerAgent)
 		} else {
 			log.Printf("Setting an unlimited rate of requests/sec, across %d agents...", numAgents)
@@ -81,6 +84,9 @@ to quickly create a Cobra application.`,
 		workReceiverChannel := transport.Receive("global-nosql-benchmark:workers")
 		workEndChannel := transport.Receive("global-nosql-benchmark:workers:finish")
 		workersChannelMap := make(map[string]*TestResult, 0)
+		CommandTypeLatenciesRead = hdrhistogram.New(1, 90000000000, 3)
+		CommandTypeLatenciesWrite = hdrhistogram.New(1, 90000000000, 3)
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -93,15 +99,70 @@ to quickly create a Cobra application.`,
 				}
 				workersChannelMap[testSpec.Metadata] = &testSpec
 				testResultFilename := fmt.Sprintf("%s.json", testSpec.Metadata)
+				testResultHistogramFilenameReads := fmt.Sprintf("%s-reads.hgrm", testSpec.Metadata)
+				testResultHistogramFilenameWrites := fmt.Sprintf("%s-inserts.hgrm", testSpec.Metadata)
 				testResultHistogramFilename := fmt.Sprintf("%s.hgrm", testSpec.Metadata)
-				log.Printf("Received result from %s agent. Saving it to %s and to .hgrm", testSpec.Metadata, testResultFilename, testResultHistogramFilename)
+				log.Printf("Received result from %s agent. Saving it to %s and to %s", testSpec.Metadata, testResultFilename, testResultHistogramFilename)
 				saveJsonResult(&testSpec, testResultFilename)
+				encWriteHistogram := testSpec.EncodedWriteHistogram
+				wH, err := hdrhistogram.Decode(encWriteHistogram)
+				if err != nil {
+					panic(err)
+				}
+				f, err := os.Create(testResultHistogramFilenameWrites)
+				if err != nil {
+					panic(err)
+				}
+				wH.PercentilesPrint(f, 1, 1)
+				f.Close()
+				encReadHistogram := testSpec.EncodedReadHistogram
+				rH, err := hdrhistogram.Decode(encReadHistogram)
+				if err != nil {
+					panic(err)
+				}
+				f, err = os.Create(testResultHistogramFilenameReads)
+				if err != nil {
+					panic(err)
+				}
+				rH.PercentilesPrint(f, 1, 1)
+				f.Close()
+				rH.Merge(wH)
+				f, err = os.Create(testResultHistogramFilename)
+				if err != nil {
+					panic(err)
+				}
+				rH.PercentilesPrint(f, 1, 1)
+				f.Close()
+				CommandTypeLatenciesRead.Merge(rH)
+				CommandTypeLatenciesWrite.Merge(wH)
+				totalAgentsDone++
+				if totalAgentsDone >= numAgents {
+					log.Printf("All %d agents are done... Saving global histogram files", totalAgentsDone)
+					f, err = os.Create("all-reads.hgrm")
+					if err != nil {
+						panic(err)
+					}
+					CommandTypeLatenciesRead.PercentilesPrint(f, 1, 1)
+					f, err = os.Create("all-inserts.hgrm")
+					if err != nil {
+						panic(err)
+					}
+					CommandTypeLatenciesWrite.PercentilesPrint(f, 1, 1)
+					totalAgentsDone = 0
+					CommandTypeLatenciesRead.Reset()
+					CommandTypeLatenciesWrite.Reset()
+				}
+
 			case workersChannelName := <-workReceiverChannel:
 				log.Printf("received new worker named %s...", workersChannelName)
 				workersChannelMap[string(workersChannelName)] = nil
 				totalAgentsReady := int64(len(workersChannelMap))
 				log.Printf("There are a total of %d agents ready. We need %d to trigger benchmark...", totalAgentsReady, numAgents)
 				if totalAgentsReady >= numAgents {
+					totalAgentsDone = 0
+					CommandTypeLatenciesRead.Reset()
+					CommandTypeLatenciesWrite.Reset()
+
 					currentUtc := time.Now().UTC().Unix()
 					delaySecs := int64(delayStart.Seconds())
 					startUtc := currentUtc + delaySecs
@@ -110,7 +171,7 @@ to quickly create a Cobra application.`,
 						log.Printf("Sending work to agent: %s ...", workerName)
 						spec := TestSpec{
 							Duration:                 duration,
-							Rps:                      uint64(rpsPerAgent),
+							Rps:                      rpsPerAgent,
 							Clients:                  connsPerAgent,
 							StartAtUnix:              startUtc,
 							ReadPreference:           readPreference,

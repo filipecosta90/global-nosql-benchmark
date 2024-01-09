@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"github.com/HdrHistogram/hdrhistogram-go"
 	goredis "github.com/go-redis/redis"
+	"github.com/magiconair/properties"
 	"github.com/matryer/vice/v2/queues/redis"
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
@@ -87,9 +88,6 @@ to quickly create a Cobra application.`,
 		errs := transport.ErrChan()
 		workersChannelFinished := transport.Send(string("global-nosql-benchmark:workers:finish"))
 
-		CommandTypeLatenciesRead = hdrhistogram.New(1, 90000000000, 3)
-		CommandTypeLatenciesWrite = hdrhistogram.New(1, 90000000000, 3)
-
 		for {
 			select {
 			case <-ctx.Done():
@@ -99,6 +97,9 @@ to quickly create a Cobra application.`,
 				log.Println("an error occurred:", err)
 			case spec := <-workReceiverChannel:
 				var testSpec TestSpec
+				CommandTypeLatenciesRead = hdrhistogram.New(1, 90000000000, 3)
+				CommandTypeLatenciesWrite = hdrhistogram.New(1, 90000000000, 3)
+
 				if err := json.Unmarshal(spec, &testSpec); err != nil {
 					panic(err)
 				}
@@ -106,6 +107,7 @@ to quickly create a Cobra application.`,
 				differenceUnix := testSpec.StartAtUnix - currentUtc
 				dataPointsProcessingWg := sync.WaitGroup{}
 				dataPointsChann := make(chan Datapoint, testSpec.Clients)
+				log.Printf("Received test spec: %v. sleeping for %d secs and starting test...", testSpec, differenceUnix)
 
 				useRateLimiter := false
 				if testSpec.Rps > 0 {
@@ -114,14 +116,22 @@ to quickly create a Cobra application.`,
 				var requestRate = Inf
 				var requestBurst = int(testSpec.Rps)
 				if testSpec.Rps != 0 {
+					log.Printf("Test spec contains rate of %d rps...", testSpec.Rps)
 					requestRate = rate.Limit(testSpec.Rps)
 					useRateLimiter = true
+				} else {
+					log.Printf("Test spec does not specify rate of ops/sec. Doing unlimited rate...")
 				}
 
 				var rateLimiter = rate.NewLimiter(requestRate, requestBurst)
-				log.Printf("Received test spec: %v. sleeping for %d secs and starting test...", testSpec, differenceUnix)
 				log.Printf("Setting read-proportion to %f and insert-proportion to %f.", testSpec.ReadProportion, testSpec.InsertProportion)
-
+				creator := GetDBCreator("redis")
+				p := properties.NewProperties()
+				dbLocalReadAddr, _ := cmd.Flags().GetString("db.local.read.addr")
+				p.Set("db.addr", testSpec.Addr)
+				p.Set("db.local.read.addr", dbLocalReadAddr)
+				p.Set("db.username", testSpec.Username)
+				p.Set("db.password", testSpec.Password)
 				time.Sleep(time.Duration(differenceUnix * int64(time.Second)))
 				log.Printf("Starting test...")
 				// Create a context with a timeout of test duration
@@ -130,8 +140,8 @@ to quickly create a Cobra application.`,
 				dataPointsProcessingWg.Add(1)
 				go processGraphDatapointsChannel(dataPointsChann, ctxTimeout, &dataPointsProcessingWg)
 				startT := time.Now()
-				creator := GetDBCreator("redis")
-				db, err := creator.Create(nil)
+
+				db, err := creator.Create(p)
 				if err != nil {
 					panic(err)
 				}
@@ -157,10 +167,14 @@ to quickly create a Cobra application.`,
 				testResult.FillDurationInfo(startT, endT, testDuration)
 				_, latenciesWrites := generateLatenciesMap(CommandTypeLatenciesWrite, testDuration)
 				_, latenciesReads := generateLatenciesMap(CommandTypeLatenciesRead, testDuration)
-				testResult.OverallClientLatencies = make([]map[string]float64, 2, 2)
-				testResult.OverallClientLatencies[0] = latenciesReads
-				testResult.OverallClientLatencies[1] = latenciesWrites
+				testResult.OverallClientLatencies = make(map[string]map[string]float64)
+				testResult.OverallClientLatencies["reads"] = latenciesReads
+				testResult.OverallClientLatencies["inserts"] = latenciesWrites
 
+				// merging histograms to get the totals
+				CommandTypeLatenciesWrite.Merge(CommandTypeLatenciesRead)
+				_, latenciesTotal := generateLatenciesMap(CommandTypeLatenciesWrite, testDuration)
+				testResult.OverallClientLatencies["total"] = latenciesTotal
 				u, err := json.Marshal(testResult)
 				if err != nil {
 					panic(err)
@@ -212,4 +226,5 @@ func init() {
 	rootCmd.AddCommand(agentCmd)
 
 	agentCmd.Flags().String("agent-unique-id", "myid", "Agent unique id")
+	agentCmd.Flags().String("db.local.read.addr", "", "comma separated value of local addresses to the db that should be prioritized")
 }

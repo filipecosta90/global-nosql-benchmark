@@ -34,7 +34,7 @@ type TestResult struct {
 	EncodedReadHistogram  []byte `json:"EncodedReadHistogram"`
 
 	// Overall Client Quantiles
-	OverallClientLatencies []map[string]float64 `json:"OverallClientLatencies"`
+	OverallClientLatencies map[string]map[string]float64 `json:"OverallClientLatencies"`
 }
 
 func NewTestResult(metadata string, clients uint64, maxRps uint64) *TestResult {
