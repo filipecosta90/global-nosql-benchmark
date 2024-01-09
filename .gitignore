@@ -3,6 +3,7 @@ coverage.txt
 global-nosql-benchmark
 dist
 *.json
+*.hgrm
 dump.rdb
 .coverdata
 .DS_Store
