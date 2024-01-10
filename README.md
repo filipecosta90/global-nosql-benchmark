@@ -18,6 +18,8 @@ https://github.com/filipecosta90/global-nosql-benchmark/releases/latest
 | Linux   | arm64 (64-bit ARM)     | [global-nosql-benchmark-linux-arm64](https://github.com/filipecosta90/global-nosql-benchmark/releases/latest/download/global-nosql-benchmark-linux-arm64.tar.gz)    |
 | Darwin   | amd64  (64-bit X86)     | [global-nosql-benchmark-darwin-amd64](https://github.com/filipecosta90/global-nosql-benchmark/releases/latest/download/global-nosql-benchmark-darwin-amd64.tar.gz)    |
 | Darwin   | arm64 (64-bit ARM)     | [global-nosql-benchmark-darwin-arm64](https://github.com/filipecosta90/global-nosql-benchmark/releases/latest/download/global-nosql-benchmark-darwin-arm64.tar.gz)    |
+| Windows   | amd64  (64-bit X86)     | [global-nosql-benchmark-darwin-amd64](https://github.com/filipecosta90/global-nosql-benchmark/releases/latest/download/global-nosql-benchmark-windows-amd64.zip)    |
+| Windows   | arm64 (64-bit ARM)     | [global-nosql-benchmark-darwin-arm64](https://github.com/filipecosta90/global-nosql-benchmark/releases/latest/download/global-nosql-benchmark-windows-arm64.zip)    |
 
 Here's how bash script to download and try it:
 
