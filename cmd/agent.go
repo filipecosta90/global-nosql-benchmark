@@ -67,8 +67,8 @@ to quickly create a Cobra application.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println("agent called")
 		ctx := context.Background()
-		viceAddr, _ := cmd.Flags().GetString("messaging-queue-addr")
-		vicePassword, _ := cmd.Flags().GetString("messaging-queue-password")
+		viceAddr, _ := cmd.Flags().GetString("messaging-queue-redis-addr")
+		vicePassword, _ := cmd.Flags().GetString("messaging-queue-redis-password")
 		redisOptions := goredis.Options{
 			Addr:     viceAddr,
 			Password: vicePassword,

@@ -51,6 +51,6 @@ func init() {
 
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.
-	rootCmd.Flags().String("messaging-queue-redis-addr", "localhost:6379", "Messaging queue address")
-	rootCmd.Flags().String("messaging-queue-redis-pass", "", "Messaging queue password")
+	rootCmd.PersistentFlags().String("messaging-queue-redis-addr", "localhost:6379", "Messaging queue address")
+	rootCmd.PersistentFlags().String("messaging-queue-redis-password", "", "Messaging queue password")
 }
